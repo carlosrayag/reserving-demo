@@ -16,13 +16,37 @@ st.set_page_config(
 DEFAULT_DB = "reserving_demo.db"
 
 def ensure_db(db_path: str):
+    # Si no existe el archivo, créalo
     if not os.path.exists(db_path):
         subprocess.check_call([
-            sys.executable,
-            "create_db.py",
-            "--db", db_path,
-            "--seed", "42",
-            "--rebuild"
+            sys.executable, "create_db.py",
+            "--db", db_path, "--seed", "42", "--rebuild"
+        ])
+        return
+
+    # Si existe, verificar que tenga datos
+    try:
+        engine = create_engine(f"sqlite:///{db_path}", future=True)
+        with engine.begin() as conn:
+            # ¿existe la tabla?
+            exists = conn.execute(text("""
+                SELECT name FROM sqlite_master
+                WHERE type='table' AND name='claims_triangle'
+            """)).fetchone()
+
+            if not exists:
+                raise RuntimeError("Tabla claims_triangle no existe")
+
+            # ¿tiene filas?
+            n = conn.execute(text("SELECT COUNT(*) FROM claims_triangle")).scalar()
+            if n == 0:
+                raise RuntimeError("Tabla claims_triangle está vacía")
+
+    except Exception:
+        # Si algo falla, reconstruir
+        subprocess.check_call([
+            sys.executable, "create_db.py",
+            "--db", db_path, "--seed", "42", "--rebuild"
         ])
 
 @st.cache_resource
