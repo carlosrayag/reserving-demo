@@ -1,6 +1,4 @@
 import os
-import sys
-import subprocess
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -18,46 +16,97 @@ st.set_page_config(
 
 DEFAULT_DB = "reserving_demo.db"
 
-# =============================
-# Garantizar existencia y consistencia de BD
-# =============================
-def ensure_db(db_path: str):
-    # 1) Si no existe el archivo, créalo
-    if not os.path.exists(db_path):
-        subprocess.check_call([
-            sys.executable, "create_db.py",
-            "--db", db_path, "--seed", "42", "--rebuild"
-        ])
-        return
-
-    # 2) Si existe, verifica que tenga tabla y datos; si falla, reconstruye
-    try:
-        engine = create_engine(f"sqlite:///{db_path}", future=True)
-        with engine.begin() as conn:
-            exists = conn.execute(text("""
-                SELECT name FROM sqlite_master
-                WHERE type='table' AND name='claims_triangle'
-            """)).fetchone()
-
-            if not exists:
-                raise RuntimeError("Tabla claims_triangle no existe")
-
-            n = conn.execute(text("SELECT COUNT(*) FROM claims_triangle")).scalar()
-            if n == 0:
-                raise RuntimeError("Tabla claims_triangle está vacía")
-
-    except Exception:
-        subprocess.check_call([
-            sys.executable, "create_db.py",
-            "--db", db_path, "--seed", "42", "--rebuild"
-        ])
+DDL = """
+CREATE TABLE IF NOT EXISTS claims_triangle (
+    lob_code TEXT NOT NULL,
+    product_code TEXT NOT NULL,
+    segment_code TEXT NOT NULL,
+    region_code TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    accident_year INTEGER NOT NULL,
+    dev_month INTEGER NOT NULL,
+    paid REAL NOT NULL,
+    incurred REAL NOT NULL,
+    PRIMARY KEY (lob_code, product_code, segment_code, region_code, currency, accident_year, dev_month)
+);
+"""
 
 # =============================
 # Caching
 # =============================
 @st.cache_resource(show_spinner=False)
 def get_engine(db_path: str):
+    # Streamlit Cloud permite escribir en el filesystem del contenedor (efímero)
+    # SQLite en archivo funciona bien para demo.
     return create_engine(f"sqlite:///{db_path}", future=True)
+
+def _generate_synthetic_triangle(seed: int = 42) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+
+    devs = [12, 24, 36, 48, 60]
+    ays = list(range(2018, 2026))  # 2018–2025
+
+    incurred_pattern = np.array([0.55, 0.78, 0.90, 0.97, 1.00])
+    paid_pattern = np.array([0.45, 0.70, 0.85, 0.95, 1.00])
+
+    slices = [
+        ("AUTO", "AUTO_STD", "RETAIL", "CENTRO", "MXN"),
+        ("AUTO", "AUTO_STD", "RETAIL", "NORTE",  "MXN"),
+        ("AUTO", "AUTO_STD", "CORP",   "CENTRO", "MXN"),
+        ("GMM",  "GMM_STD",  "RETAIL", "CENTRO", "MXN"),
+    ]
+
+    rows = []
+    base_ultimate = 120_000_000
+    trend = 0.06
+
+    for (lob, prod, seg, reg, ccy) in slices:
+        for i, ay in enumerate(ays):
+            ult_mean = base_ultimate * ((1 + trend) ** (i - (len(ays)-1)))
+            ultimate = ult_mean * rng.lognormal(mean=0.0, sigma=0.10)
+
+            incurred_cum = ultimate * incurred_pattern * rng.lognormal(0.0, 0.03, size=len(devs))
+            incurred_cum = np.maximum.accumulate(incurred_cum)
+
+            paid_cum = ultimate * paid_pattern * rng.lognormal(0.0, 0.05, size=len(devs))
+            paid_cum = np.maximum.accumulate(paid_cum)
+
+            # AY recientes con menos desarrollo
+            max_dev_idx = len(devs) - 1 - max(0, (ay - 2021))
+            max_dev_idx = int(np.clip(max_dev_idx, 0, len(devs)-1))
+
+            for j, d in enumerate(devs):
+                if j <= max_dev_idx:
+                    rows.append({
+                        "lob_code": lob,
+                        "product_code": prod,
+                        "segment_code": seg,
+                        "region_code": reg,
+                        "currency": ccy,
+                        "accident_year": int(ay),
+                        "dev_month": int(d),
+                        "paid": float(paid_cum[j]),
+                        "incurred": float(incurred_cum[j]),
+                    })
+
+    return pd.DataFrame(rows)
+
+def ensure_db(db_path: str, seed: int = 42):
+    """
+    A prueba de Streamlit Cloud:
+    - crea tabla si no existe
+    - si no hay filas, inserta datos simulados
+    """
+    engine = get_engine(db_path)
+
+    with engine.begin() as conn:
+        conn.execute(text(DDL))
+
+        n = conn.execute(text("SELECT COUNT(*) FROM claims_triangle")).scalar()
+        if n is None or int(n) == 0:
+            df = _generate_synthetic_triangle(seed=seed)
+            # Insertar con pandas (rápido y estable)
+            df.to_sql("claims_triangle", engine, if_exists="append", index=False)
 
 @st.cache_data(show_spinner=False)
 def fetch_distinct(db_path: str, column: str):
@@ -81,11 +130,7 @@ def load_triangle(db_path: str, measure: str, lob: str, product: str, segment: s
         ORDER BY accident_year, dev_month
     """)
     df = pd.read_sql(q, engine, params={
-        "lob": lob,
-        "product": product,
-        "segment": segment,
-        "region": region,
-        "currency": currency
+        "lob": lob, "product": product, "segment": segment, "region": region, "currency": currency
     })
     tri = df.pivot(index="accident_year", columns="dev_month", values="value")
     tri = tri.sort_index().sort_index(axis=1)
@@ -109,28 +154,27 @@ def chain_ladder_factors(triangle: pd.DataFrame) -> pd.Series:
 def project_ultimate(triangle: pd.DataFrame, factors: pd.Series) -> pd.DataFrame:
     devs = list(triangle.columns)
     fvals = factors.values
-
     rows = []
+
     for ay in triangle.index:
         row = triangle.loc[ay]
         last_dev = row.last_valid_index()
         if last_dev is None:
             continue
-        last_val = row[last_dev]
+        last_val = float(row[last_dev])
         idx = devs.index(last_dev)
 
-        # Producto de factores desde el último dev hacia el final
         if idx < len(fvals):
             tail_prod = np.prod([x for x in fvals[idx:] if pd.notna(x)])
         else:
             tail_prod = 1.0
 
-        ultimate = float(last_val) * float(tail_prod)
+        ultimate = last_val * float(tail_prod)
         rows.append({
             "Accident Year": int(ay),
-            "Latest": float(last_val),
-            "Ultimate": float(ultimate),
-            "IBNR": float(ultimate - last_val)
+            "Latest": last_val,
+            "Ultimate": ultimate,
+            "IBNR": ultimate - last_val
         })
 
     out = pd.DataFrame(rows)
@@ -139,30 +183,26 @@ def project_ultimate(triangle: pd.DataFrame, factors: pd.Series) -> pd.DataFrame
     return out
 
 # =============================
-# Sidebar (Parámetros)
+# Sidebar
 # =============================
 st.sidebar.title("Parámetros")
 
 db_path = st.sidebar.text_input("Base de datos", DEFAULT_DB).strip() or DEFAULT_DB
 
-# Garantiza BD válida antes de consultar catálogos
-ensure_db(db_path)
+# Asegurar BD y datos
+ensure_db(db_path, seed=42)
 
 measure = st.sidebar.selectbox("Medida", ["Incurred", "Paid"])
 
-# Cargar catálogos con guardas
-try:
-    lobs = fetch_distinct(db_path, "lob_code")
-    products = fetch_distinct(db_path, "product_code")
-    segments = fetch_distinct(db_path, "segment_code")
-    regions = fetch_distinct(db_path, "region_code")
-    currencies = fetch_distinct(db_path, "currency")
-except Exception:
-    st.error("No se pudo cargar la BD. Revisa que 'create_db.py' exista en el repo y que la BD se pueda generar.")
-    st.stop()
+# Catálogos
+lobs = fetch_distinct(db_path, "lob_code")
+products = fetch_distinct(db_path, "product_code")
+segments = fetch_distinct(db_path, "segment_code")
+regions = fetch_distinct(db_path, "region_code")
+currencies = fetch_distinct(db_path, "currency")
 
 if not lobs:
-    st.error("La base no contiene datos. Intenta recargar la página; el sistema intentará regenerar la BD.")
+    st.error("La base no tiene datos (inesperado). Recarga la página.")
     st.stop()
 
 lob = st.sidebar.selectbox("Línea", lobs)
@@ -183,24 +223,19 @@ triangle = load_triangle(db_path, measure, lob, product, segment, region, curren
 
 st.subheader("Triángulo acumulado")
 if triangle.empty:
-    st.info("No hay datos para la combinación seleccionada. Cambia los filtros o regenera la base.")
+    st.info("No hay datos para la combinación seleccionada. Cambia los filtros.")
 else:
     st.dataframe(triangle.style.format("{:,.0f}"), use_container_width=True)
 
 if run:
     if triangle.empty:
-        st.warning("No se puede ejecutar simulación: el triángulo está vacío para el slice seleccionado.")
+        st.warning("No se puede ejecutar simulación: el triángulo está vacío.")
         st.stop()
 
     factors = chain_ladder_factors(triangle)
-
-    # Si hay factores NaN por falta de datos, avisar (sin crashear)
-    if factors.isna().any():
-        st.warning("Algunos factores no pudieron calcularse (falta de datos en ciertas diagonales). Se usará lo disponible.")
-
     results = project_ultimate(triangle, factors)
 
-    if results.empty or not all(col in results.columns for col in ["Latest", "Ultimate", "IBNR"]):
+    if results.empty:
         st.error("No se pudieron generar resultados para este triángulo. Prueba con otro slice.")
         st.stop()
 
@@ -216,6 +251,6 @@ if run:
     st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Factores Chain Ladder")
-    factors_df = factors.reset_index()
-    factors_df.columns = ["Desarrollo", "Factor"]
-    st.dataframe(factors_df.style.format({"Factor": "{:.4f}"}), use_container_width=True)
+    fdf = factors.reset_index()
+    fdf.columns = ["Desarrollo", "Factor"]
+    st.dataframe(fdf.style.format({"Factor": "{:.4f}"}), use_container_width=True)
