@@ -1,4 +1,3 @@
-import os
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -10,7 +9,7 @@ from sqlalchemy import create_engine, text
 # Configuración general
 # =============================
 st.set_page_config(
-    page_title="Simulador de Reservas – Chain Ladder",
+    page_title="Simulador de Reservas – Chain Ladder (Laboratorio)",
     page_icon="📊",
     layout="wide"
 )
@@ -33,7 +32,7 @@ CREATE TABLE IF NOT EXISTS claims_triangle (
 """
 
 # =============================
-# Caching
+# Engine / BD
 # =============================
 @st.cache_resource(show_spinner=False)
 def get_engine(db_path: str):
@@ -70,7 +69,6 @@ def _generate_synthetic_triangle(seed: int = 42) -> pd.DataFrame:
             paid_cum = ultimate * paid_pattern * rng.lognormal(0.0, 0.05, size=len(devs))
             paid_cum = np.maximum.accumulate(paid_cum)
 
-            # AY recientes con menos desarrollo
             max_dev_idx = len(devs) - 1 - max(0, (ay - 2021))
             max_dev_idx = int(np.clip(max_dev_idx, 0, len(devs)-1))
 
@@ -91,16 +89,9 @@ def _generate_synthetic_triangle(seed: int = 42) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 def ensure_db(db_path: str, seed: int = 42):
-    """
-    A prueba de Streamlit Cloud:
-    - crea tabla si no existe
-    - si no hay filas, inserta datos simulados
-    """
     engine = get_engine(db_path)
-
     with engine.begin() as conn:
         conn.execute(text(DDL))
-
         n = conn.execute(text("SELECT COUNT(*) FROM claims_triangle")).scalar()
         if n is None or int(n) == 0:
             df = _generate_synthetic_triangle(seed=seed)
@@ -135,21 +126,41 @@ def load_triangle(db_path: str, measure: str, lob: str, product: str, segment: s
     return tri
 
 # =============================
-# Modelo Chain Ladder
+# Chain Ladder (métodos de factores)
 # =============================
-def chain_ladder_factors(triangle: pd.DataFrame) -> pd.Series:
+def _ata_factor(triangle: pd.DataFrame, c0: int, c1: int, method: str) -> float:
+    """Calcula factor c0->c1 según método."""
+    mask = triangle[c0].notna() & triangle[c1].notna()
+    x = triangle.loc[mask, c0].astype(float)
+    y = triangle.loc[mask, c1].astype(float)
+
+    if len(x) == 0:
+        return np.nan
+
+    ratios = (y / x).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(ratios) == 0:
+        return np.nan
+
+    if method == "Ponderado (volumen)":
+        denom = x.sum()
+        num = y.sum()
+        return (num / denom) if denom > 0 else np.nan
+    elif method == "Promedio simple":
+        return float(ratios.mean())
+    elif method == "Mediana":
+        return float(ratios.median())
+    else:
+        return float(ratios.mean())
+
+def chain_ladder_factors(triangle: pd.DataFrame, method: str) -> pd.Series:
     devs = list(triangle.columns)
     f = []
     for i in range(len(devs) - 1):
         c0, c1 = devs[i], devs[i + 1]
-        mask = triangle[c0].notna() & triangle[c1].notna()
-        denom = triangle.loc[mask, c0].sum()
-        num = triangle.loc[mask, c1].sum()
-        factor = (num / denom) if denom and denom > 0 else np.nan
-        f.append(factor)
+        f.append(_ata_factor(triangle, c0, c1, method))
     return pd.Series(f, index=[f"{devs[i]}->{devs[i+1]}" for i in range(len(devs)-1)])
 
-def project_ultimate(triangle: pd.DataFrame, factors: pd.Series) -> pd.DataFrame:
+def project_ultimate(triangle: pd.DataFrame, factors: pd.Series, tail_factor: float = 1.0) -> pd.DataFrame:
     devs = list(triangle.columns)
     fvals = factors.values
     rows = []
@@ -163,14 +174,17 @@ def project_ultimate(triangle: pd.DataFrame, factors: pd.Series) -> pd.DataFrame
         idx = devs.index(last_dev)
 
         if idx < len(fvals):
-            tail_prod = np.prod([x for x in fvals[idx:] if pd.notna(x)])
+            base_ldf = np.prod([x for x in fvals[idx:] if pd.notna(x)])
         else:
-            tail_prod = 1.0
+            base_ldf = 1.0
 
-        ultimate = last_val * float(tail_prod)
+        ldf_total = float(base_ldf) * float(tail_factor)
+        ultimate = last_val * ldf_total
+
         rows.append({
             "Accident Year": int(ay),
             "Latest": last_val,
+            "LDF_total": ldf_total,
             "Ultimate": ultimate,
             "IBNR": ultimate - last_val
         })
@@ -181,16 +195,40 @@ def project_ultimate(triangle: pd.DataFrame, factors: pd.Series) -> pd.DataFrame
     return out
 
 # =============================
+# Escenario de inflación (stress)
+# =============================
+def apply_inflation_stress(results: pd.DataFrame, annual_inflation: float, horizon_years: float = 1.0) -> pd.DataFrame:
+    """
+    Ajuste simple y defendible para demo:
+    - Inflación afecta principalmente la parte no observada: IBNR.
+    - Escalamos IBNR por (1+infl)^horizon.
+    """
+    out = results.copy()
+    factor = (1.0 + annual_inflation) ** horizon_years
+    out["IBNR_stress"] = out["IBNR"] * factor
+    out["Ultimate_stress"] = out["Latest"] + out["IBNR_stress"]
+    out["Stress_factor"] = factor
+    return out
+
+# =============================
 # Sidebar
 # =============================
 st.sidebar.title("Parámetros")
 
 db_path = st.sidebar.text_input("Base de datos", DEFAULT_DB).strip() or DEFAULT_DB
-
-# Asegurar BD y datos
 ensure_db(db_path, seed=42)
 
 measure = st.sidebar.selectbox("Medida", ["Incurred", "Paid"])
+
+factor_method = st.sidebar.selectbox(
+    "Método de factores",
+    ["Ponderado (volumen)", "Promedio simple", "Mediana"]
+)
+
+tail_factor = st.sidebar.slider("Tail factor", min_value=1.00, max_value=1.10, value=1.00, step=0.005)
+
+infl = st.sidebar.slider("Inflación anual (stress)", min_value=0.0, max_value=0.20, value=0.0, step=0.01)
+horizon = st.sidebar.slider("Horizonte (años) para stress", min_value=0.5, max_value=3.0, value=1.0, step=0.5)
 
 # Catálogos
 lobs = fetch_distinct(db_path, "lob_code")
@@ -199,17 +237,12 @@ segments = fetch_distinct(db_path, "segment_code")
 regions = fetch_distinct(db_path, "region_code")
 currencies = fetch_distinct(db_path, "currency")
 
-if not lobs:
-    st.error("La base no tiene datos (inesperado). Recarga la página.")
-    st.stop()
-
 lob = st.sidebar.selectbox("Línea", lobs)
 product = st.sidebar.selectbox("Producto", products)
 segment = st.sidebar.selectbox("Segmento", segments)
 region = st.sidebar.selectbox("Región", regions)
 currency = st.sidebar.selectbox("Moneda", currencies)
 
-# Paso 9 — Reset demo
 if st.sidebar.button("Reset (demo)"):
     st.cache_data.clear()
     st.cache_resource.clear()
@@ -220,65 +253,78 @@ run = st.sidebar.button("Ejecutar simulación")
 # =============================
 # Main
 # =============================
-st.title("📊 Simulador de Reservas – Chain Ladder")
-st.caption("Los datos mostrados son simulados y utilizados únicamente con fines ilustrativos.")
+st.title("📊 Laboratorio de Reservas – Chain Ladder")
+st.caption("Datos simulados con fines ilustrativos. El objetivo es mostrar sensibilidad a supuestos y escenarios.")
 
 triangle = load_triangle(db_path, measure, lob, product, segment, region, currency)
 
-st.subheader("Triángulo acumulado")
-
-# Paso 7 — Optimización visual/performance
+# Triángulo (performance: preview)
+st.subheader("Triángulo acumulado (preview)")
 if triangle.empty:
     st.info("No hay datos para la combinación seleccionada. Cambia los filtros.")
+    st.stop()
 else:
     st.dataframe(triangle.round(0).head(10), use_container_width=True)
 
-    # Paso 8B — Heatmap del triángulo (muy visual)
-    heat = px.imshow(
-        triangle,
-        aspect="auto",
-        title="Heatmap del triángulo (valores acumulados)",
-    )
+    heat = px.imshow(triangle, aspect="auto", title="Heatmap del triángulo (valores acumulados)")
     st.plotly_chart(heat, use_container_width=True)
 
 if run:
-    if triangle.empty:
-        st.warning("No se puede ejecutar simulación: el triángulo está vacío.")
-        st.stop()
-
-    factors = chain_ladder_factors(triangle)
-    results = project_ultimate(triangle, factors)
+    factors = chain_ladder_factors(triangle, factor_method)
+    results = project_ultimate(triangle, factors, tail_factor=tail_factor)
 
     if results.empty:
-        st.error("No se pudieron generar resultados para este triángulo. Prueba con otro slice.")
+        st.error("No se pudieron generar resultados. Prueba otra combinación.")
         st.stop()
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Latest total", f"{results['Latest'].sum():,.0f}")
-    c2.metric("Ultimate total", f"{results['Ultimate'].sum():,.0f}")
-    c3.metric("IBNR total", f"{results['IBNR'].sum():,.0f}")
+    stress = apply_inflation_stress(results, annual_inflation=infl, horizon_years=horizon)
 
-    # Paso 8A — Waterfall Latest → IBNR → Ultimate
+    # KPIs base
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Latest total", f"{results['Latest'].sum():,.0f}")
+    c2.metric("IBNR total", f"{results['IBNR'].sum():,.0f}")
+    c3.metric("Ultimate total", f"{results['Ultimate'].sum():,.0f}")
+    c4.metric("Ultimate (stress)", f"{stress['Ultimate_stress'].sum():,.0f}")
+
+    # Waterfall base
     water = pd.DataFrame({
         "Concepto": ["Latest", "IBNR", "Ultimate"],
         "Valor": [results["Latest"].sum(), results["IBNR"].sum(), results["Ultimate"].sum()]
     })
-
     wf = go.Figure(go.Waterfall(
-        name="",
         orientation="v",
         measure=["absolute", "relative", "total"],
         x=water["Concepto"],
         y=water["Valor"],
     ))
-    wf.update_layout(title="Puente: Latest → IBNR → Ultimate", showlegend=False)
+    wf.update_layout(title="Puente (base): Latest → IBNR → Ultimate", showlegend=False)
     st.plotly_chart(wf, use_container_width=True)
 
-    st.subheader("Resultados por año de ocurrencia")
-    st.dataframe(results.round(0), use_container_width=True)
+    # Waterfall stress (Latest + IBNR_stress)
+    water_s = pd.DataFrame({
+        "Concepto": ["Latest", "IBNR (stress)", "Ultimate (stress)"],
+        "Valor": [stress["Latest"].sum(), stress["IBNR_stress"].sum(), stress["Ultimate_stress"].sum()]
+    })
+    wf2 = go.Figure(go.Waterfall(
+        orientation="v",
+        measure=["absolute", "relative", "total"],
+        x=water_s["Concepto"],
+        y=water_s["Valor"],
+    ))
+    wf2.update_layout(title="Puente (stress): Latest → IBNR_stress → Ultimate_stress", showlegend=False)
+    st.plotly_chart(wf2, use_container_width=True)
 
-    fig = px.bar(results, x="Accident Year", y="IBNR", title="IBNR por Accident Year")
+    st.subheader("Resultados por Accident Year (base vs stress)")
+    show = stress[["Accident Year", "Latest", "LDF_total", "Ultimate", "IBNR", "Ultimate_stress", "IBNR_stress"]].copy()
+    st.dataframe(show.round(0), use_container_width=True)
+
+    # IBNR por AY (base)
+    fig = px.bar(results, x="Accident Year", y="IBNR", title="IBNR por Accident Year (base)")
     st.plotly_chart(fig, use_container_width=True)
+
+    # IBNR por AY (stress)
+    fig2 = px.bar(stress, x="Accident Year", y="IBNR_stress", title="IBNR por Accident Year (stress)")
+    st.plotly_chart(fig2, use_container_width=True)
 
     st.subheader("Factores Chain Ladder")
     fdf = factors.reset_index()
