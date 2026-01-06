@@ -2,6 +2,7 @@ import os
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 from sqlalchemy import create_engine, text
 
@@ -36,8 +37,6 @@ CREATE TABLE IF NOT EXISTS claims_triangle (
 # =============================
 @st.cache_resource(show_spinner=False)
 def get_engine(db_path: str):
-    # Streamlit Cloud permite escribir en el filesystem del contenedor (efímero)
-    # SQLite en archivo funciona bien para demo.
     return create_engine(f"sqlite:///{db_path}", future=True)
 
 def _generate_synthetic_triangle(seed: int = 42) -> pd.DataFrame:
@@ -105,7 +104,6 @@ def ensure_db(db_path: str, seed: int = 42):
         n = conn.execute(text("SELECT COUNT(*) FROM claims_triangle")).scalar()
         if n is None or int(n) == 0:
             df = _generate_synthetic_triangle(seed=seed)
-            # Insertar con pandas (rápido y estable)
             df.to_sql("claims_triangle", engine, if_exists="append", index=False)
 
 @st.cache_data(show_spinner=False)
@@ -211,6 +209,12 @@ segment = st.sidebar.selectbox("Segmento", segments)
 region = st.sidebar.selectbox("Región", regions)
 currency = st.sidebar.selectbox("Moneda", currencies)
 
+# Paso 9 — Reset demo
+if st.sidebar.button("Reset (demo)"):
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.rerun()
+
 run = st.sidebar.button("Ejecutar simulación")
 
 # =============================
@@ -222,10 +226,20 @@ st.caption("Los datos mostrados son simulados y utilizados únicamente con fines
 triangle = load_triangle(db_path, measure, lob, product, segment, region, currency)
 
 st.subheader("Triángulo acumulado")
+
+# Paso 7 — Optimización visual/performance
 if triangle.empty:
     st.info("No hay datos para la combinación seleccionada. Cambia los filtros.")
 else:
-    st.dataframe(triangle.style.format("{:,.0f}"), use_container_width=True)
+    st.dataframe(triangle.round(0).head(10), use_container_width=True)
+
+    # Paso 8B — Heatmap del triángulo (muy visual)
+    heat = px.imshow(
+        triangle,
+        aspect="auto",
+        title="Heatmap del triángulo (valores acumulados)",
+    )
+    st.plotly_chart(heat, use_container_width=True)
 
 if run:
     if triangle.empty:
@@ -244,8 +258,24 @@ if run:
     c2.metric("Ultimate total", f"{results['Ultimate'].sum():,.0f}")
     c3.metric("IBNR total", f"{results['IBNR'].sum():,.0f}")
 
+    # Paso 8A — Waterfall Latest → IBNR → Ultimate
+    water = pd.DataFrame({
+        "Concepto": ["Latest", "IBNR", "Ultimate"],
+        "Valor": [results["Latest"].sum(), results["IBNR"].sum(), results["Ultimate"].sum()]
+    })
+
+    wf = go.Figure(go.Waterfall(
+        name="",
+        orientation="v",
+        measure=["absolute", "relative", "total"],
+        x=water["Concepto"],
+        y=water["Valor"],
+    ))
+    wf.update_layout(title="Puente: Latest → IBNR → Ultimate", showlegend=False)
+    st.plotly_chart(wf, use_container_width=True)
+
     st.subheader("Resultados por año de ocurrencia")
-    st.dataframe(results.style.format("{:,.0f}"), use_container_width=True)
+    st.dataframe(results.round(0), use_container_width=True)
 
     fig = px.bar(results, x="Accident Year", y="IBNR", title="IBNR por Accident Year")
     st.plotly_chart(fig, use_container_width=True)
