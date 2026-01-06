@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, text
 # Configuración general
 # =============================
 st.set_page_config(
-    page_title="Simulador de Reservas – Chain Ladder (Laboratorio)",
+    page_title="Laboratorio de Reservas – Chain Ladder (Escenarios + Bootstrap)",
     page_icon="📊",
     layout="wide"
 )
@@ -129,7 +129,6 @@ def load_triangle(db_path: str, measure: str, lob: str, product: str, segment: s
 # Chain Ladder (métodos de factores)
 # =============================
 def _ata_factor(triangle: pd.DataFrame, c0: int, c1: int, method: str) -> float:
-    """Calcula factor c0->c1 según método."""
     mask = triangle[c0].notna() & triangle[c1].notna()
     x = triangle.loc[mask, c0].astype(float)
     y = triangle.loc[mask, c1].astype(float)
@@ -195,20 +194,137 @@ def project_ultimate(triangle: pd.DataFrame, factors: pd.Series, tail_factor: fl
     return out
 
 # =============================
-# Escenario de inflación (stress)
+# Stress por inflación
 # =============================
 def apply_inflation_stress(results: pd.DataFrame, annual_inflation: float, horizon_years: float = 1.0) -> pd.DataFrame:
-    """
-    Ajuste simple y defendible para demo:
-    - Inflación afecta principalmente la parte no observada: IBNR.
-    - Escalamos IBNR por (1+infl)^horizon.
-    """
     out = results.copy()
     factor = (1.0 + annual_inflation) ** horizon_years
     out["IBNR_stress"] = out["IBNR"] * factor
     out["Ultimate_stress"] = out["Latest"] + out["IBNR_stress"]
     out["Stress_factor"] = factor
     return out
+
+# =============================
+# Bootstrap (Incremento 3)
+# =============================
+def _ratios_by_dev(triangle: pd.DataFrame):
+    """
+    Devuelve diccionario: (c0,c1) -> array de ratios y/x, para resampling.
+    """
+    devs = list(triangle.columns)
+    ratios = {}
+    for i in range(len(devs) - 1):
+        c0, c1 = devs[i], devs[i + 1]
+        mask = triangle[c0].notna() & triangle[c1].notna()
+        x = triangle.loc[mask, c0].astype(float)
+        y = triangle.loc[mask, c1].astype(float)
+        r = (y / x).replace([np.inf, -np.inf], np.nan).dropna().values
+        ratios[(c0, c1)] = r
+    return ratios
+
+def _bootstrap_factor_from_ratios(rng: np.random.Generator, r: np.ndarray, method: str) -> float:
+    """
+    Genera un factor bootstrap re-muestreando ratios (con reemplazo).
+    """
+    if r is None or len(r) == 0:
+        return np.nan
+    sample = rng.choice(r, size=len(r), replace=True)
+
+    if method == "Ponderado (volumen)":
+        # En demo, aproximamos ponderado con media de ratios (simplemente).
+        # Si quisieras exacto ponderado, habría que re-muestrear pares (x,y).
+        return float(np.nanmean(sample))
+    elif method == "Promedio simple":
+        return float(np.nanmean(sample))
+    elif method == "Mediana":
+        return float(np.nanmedian(sample))
+    else:
+        return float(np.nanmean(sample))
+
+@st.cache_data(show_spinner=False)
+def bootstrap_distribution(
+    triangle: pd.DataFrame,
+    method: str,
+    tail_factor: float,
+    annual_inflation: float,
+    horizon_years: float,
+    n_sims: int,
+    seed: int
+):
+    """
+    Retorna DataFrame con distribuciones de IBNR_total y Ultimate_total (base y stress).
+    Cacheado para que sea usable en Cloud.
+    """
+    rng = np.random.default_rng(seed)
+    devs = list(triangle.columns)
+    ratios = _ratios_by_dev(triangle)
+
+    # Precomputar Latest por AY (determinista)
+    latest_by_ay = {}
+    last_dev_by_ay = {}
+    for ay in triangle.index:
+        row = triangle.loc[ay]
+        ld = row.last_valid_index()
+        if ld is None:
+            continue
+        latest_by_ay[int(ay)] = float(row[ld])
+        last_dev_by_ay[int(ay)] = int(ld)
+
+    ays = sorted(latest_by_ay.keys())
+    latest_total = sum(latest_by_ay.values())
+
+    infl_factor = (1.0 + annual_inflation) ** horizon_years
+
+    out = []
+    for s in range(n_sims):
+        # 1) Simular factores por edad (bootstrap)
+        f_sim = []
+        for i in range(len(devs) - 1):
+            c0, c1 = devs[i], devs[i + 1]
+            f_sim.append(_bootstrap_factor_from_ratios(rng, ratios.get((c0, c1), np.array([])), method))
+        f_sim = np.array(f_sim, dtype=float)
+
+        # Reemplazar NaNs por 1.0 para estabilidad (si falta data)
+        f_sim = np.where(np.isnan(f_sim), 1.0, f_sim)
+
+        # 2) Calcular Ultimate e IBNR total simulados
+        ultimate_total = 0.0
+        for ay in ays:
+            ld = last_dev_by_ay[ay]
+            idx = devs.index(ld)
+            base_ldf = np.prod(f_sim[idx:]) if idx < len(f_sim) else 1.0
+            ldf_total = float(base_ldf) * float(tail_factor)
+            ultimate_total += latest_by_ay[ay] * ldf_total
+
+        ibnr_total = ultimate_total - latest_total
+
+        # 3) Stress inflación sobre IBNR
+        ibnr_stress = ibnr_total * infl_factor
+        ultimate_stress = latest_total + ibnr_stress
+
+        out.append({
+            "sim": s + 1,
+            "Latest_total": latest_total,
+            "Ultimate_total": ultimate_total,
+            "IBNR_total": ibnr_total,
+            "Ultimate_stress": ultimate_stress,
+            "IBNR_stress": ibnr_stress
+        })
+
+    dist = pd.DataFrame(out)
+    return dist
+
+def percentile_summary(dist: pd.DataFrame, col: str):
+    qs = [0.50, 0.75, 0.90, 0.95]
+    vals = dist[col].quantile(qs).to_dict()
+    return {
+        "P50": vals[0.50],
+        "P75": vals[0.75],
+        "P90": vals[0.90],
+        "P95": vals[0.95],
+        "Media": dist[col].mean(),
+        "Std": dist[col].std(ddof=1)
+    }
 
 # =============================
 # Sidebar
@@ -229,6 +345,13 @@ tail_factor = st.sidebar.slider("Tail factor", min_value=1.00, max_value=1.10, v
 
 infl = st.sidebar.slider("Inflación anual (stress)", min_value=0.0, max_value=0.20, value=0.0, step=0.01)
 horizon = st.sidebar.slider("Horizonte (años) para stress", min_value=0.5, max_value=3.0, value=1.0, step=0.5)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Bootstrap (incertidumbre)")
+
+do_bootstrap = st.sidebar.checkbox("Activar bootstrap", value=True)
+n_sims = st.sidebar.slider("Número de simulaciones", 100, 2000, 400, 100)
+boot_seed = st.sidebar.number_input("Seed", value=123, step=1)
 
 # Catálogos
 lobs = fetch_distinct(db_path, "lob_code")
@@ -254,37 +377,31 @@ run = st.sidebar.button("Ejecutar simulación")
 # Main
 # =============================
 st.title("📊 Laboratorio de Reservas – Chain Ladder")
-st.caption("Datos simulados con fines ilustrativos. El objetivo es mostrar sensibilidad a supuestos y escenarios.")
+st.caption("Datos simulados con fines ilustrativos. Objetivo: sensibilidad a supuestos + incertidumbre (bootstrap).")
 
 triangle = load_triangle(db_path, measure, lob, product, segment, region, currency)
 
-# Triángulo (performance: preview)
 st.subheader("Triángulo acumulado (preview)")
 if triangle.empty:
     st.info("No hay datos para la combinación seleccionada. Cambia los filtros.")
     st.stop()
-else:
-    st.dataframe(triangle.round(0).head(10), use_container_width=True)
 
-    heat = px.imshow(triangle, aspect="auto", title="Heatmap del triángulo (valores acumulados)")
-    st.plotly_chart(heat, use_container_width=True)
+st.dataframe(triangle.round(0).head(10), use_container_width=True)
+heat = px.imshow(triangle, aspect="auto", title="Heatmap del triángulo (valores acumulados)")
+st.plotly_chart(heat, use_container_width=True)
 
 if run:
+    # Base determinista
     factors = chain_ladder_factors(triangle, factor_method)
     results = project_ultimate(triangle, factors, tail_factor=tail_factor)
-
-    if results.empty:
-        st.error("No se pudieron generar resultados. Prueba otra combinación.")
-        st.stop()
-
     stress = apply_inflation_stress(results, annual_inflation=infl, horizon_years=horizon)
 
-    # KPIs base
+    # KPIs
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Latest total", f"{results['Latest'].sum():,.0f}")
-    c2.metric("IBNR total", f"{results['IBNR'].sum():,.0f}")
-    c3.metric("Ultimate total", f"{results['Ultimate'].sum():,.0f}")
-    c4.metric("Ultimate (stress)", f"{stress['Ultimate_stress'].sum():,.0f}")
+    c2.metric("IBNR total (base)", f"{results['IBNR'].sum():,.0f}")
+    c3.metric("Ultimate total (base)", f"{results['Ultimate'].sum():,.0f}")
+    c4.metric("Ultimate total (stress)", f"{stress['Ultimate_stress'].sum():,.0f}")
 
     # Waterfall base
     water = pd.DataFrame({
@@ -300,7 +417,7 @@ if run:
     wf.update_layout(title="Puente (base): Latest → IBNR → Ultimate", showlegend=False)
     st.plotly_chart(wf, use_container_width=True)
 
-    # Waterfall stress (Latest + IBNR_stress)
+    # Waterfall stress
     water_s = pd.DataFrame({
         "Concepto": ["Latest", "IBNR (stress)", "Ultimate (stress)"],
         "Valor": [stress["Latest"].sum(), stress["IBNR_stress"].sum(), stress["Ultimate_stress"].sum()]
@@ -318,11 +435,9 @@ if run:
     show = stress[["Accident Year", "Latest", "LDF_total", "Ultimate", "IBNR", "Ultimate_stress", "IBNR_stress"]].copy()
     st.dataframe(show.round(0), use_container_width=True)
 
-    # IBNR por AY (base)
     fig = px.bar(results, x="Accident Year", y="IBNR", title="IBNR por Accident Year (base)")
     st.plotly_chart(fig, use_container_width=True)
 
-    # IBNR por AY (stress)
     fig2 = px.bar(stress, x="Accident Year", y="IBNR_stress", title="IBNR por Accident Year (stress)")
     st.plotly_chart(fig2, use_container_width=True)
 
@@ -330,3 +445,61 @@ if run:
     fdf = factors.reset_index()
     fdf.columns = ["Desarrollo", "Factor"]
     st.dataframe(fdf.style.format({"Factor": "{:.4f}"}), use_container_width=True)
+
+    # =============================
+    # Bootstrap outputs (Incremento 3)
+    # =============================
+    if do_bootstrap:
+        st.subheader("Incertidumbre (Bootstrap)")
+        with st.spinner("Corriendo bootstrap…"):
+            dist = bootstrap_distribution(
+                triangle=triangle,
+                method=factor_method,
+                tail_factor=tail_factor,
+                annual_inflation=infl,
+                horizon_years=horizon,
+                n_sims=int(n_sims),
+                seed=int(boot_seed),
+            )
+
+        # Percentiles
+        sum_u = percentile_summary(dist, "Ultimate_total")
+        sum_i = percentile_summary(dist, "IBNR_total")
+        sum_us = percentile_summary(dist, "Ultimate_stress")
+        sum_is = percentile_summary(dist, "IBNR_stress")
+
+        st.markdown("**Percentiles (Base):**")
+        ptab = pd.DataFrame({
+            "Ultimate_total": sum_u,
+            "IBNR_total": sum_i,
+        })
+        st.dataframe(ptab.applymap(lambda x: f"{x:,.0f}"), use_container_width=True)
+
+        st.markdown("**Percentiles (Stress):**")
+        ptab2 = pd.DataFrame({
+            "Ultimate_stress": sum_us,
+            "IBNR_stress": sum_is,
+        })
+        st.dataframe(ptab2.applymap(lambda x: f"{x:,.0f}"), use_container_width=True)
+
+        # Histogramas
+        h1 = px.histogram(dist, x="IBNR_total", nbins=40, title="Distribución IBNR total (base)")
+        st.plotly_chart(h1, use_container_width=True)
+
+        h2 = px.histogram(dist, x="Ultimate_total", nbins=40, title="Distribución Ultimate total (base)")
+        st.plotly_chart(h2, use_container_width=True)
+
+        h3 = px.histogram(dist, x="IBNR_stress", nbins=40, title="Distribución IBNR total (stress)")
+        st.plotly_chart(h3, use_container_width=True)
+
+        # Línea de percentiles sobre hist (marcas)
+        for label, q in [("P50", 0.50), ("P75", 0.75), ("P90", 0.90), ("P95", 0.95)]:
+            v = dist["IBNR_total"].quantile(q)
+            h1.add_vline(x=float(v), annotation_text=label, annotation_position="top")
+
+        # Mostrar una muestra
+        st.markdown("**Muestra de simulaciones (primeras 20):**")
+        st.dataframe(dist.head(20).round(0), use_container_width=True)
+
+    else:
+        st.info("Bootstrap desactivado. Actívalo en el sidebar para ver percentiles y distribuciones.")
